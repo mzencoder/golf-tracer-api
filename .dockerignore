@@ -1,0 +1,12 @@
+.git
+.venv
+__pycache__
+.pytest_cache
+.env
+data
+uploads
+results
+sample
+golf-ball-tracker
+video-highlight-extractor
+*.raw.mp4
