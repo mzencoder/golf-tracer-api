@@ -47,10 +47,12 @@ This is an integration example; wiring Subpar itself is outside this repository.
 
 `GET /healthz` is public. OpenAPI documentation is at `/docs`.
 
-1. `POST /v1/jobs` with multipart form field `video` (`.mp4`, `.mov`, `.m4v`). Returns HTTP 202: `{"id":"...","status":"queued","progress":0,"status_url":"/v1/jobs/..."}`.
+1. `POST /v1/jobs` with multipart form field `video` (`.mp4`, `.mov`, `.m4v`). To render a manually adjusted path without running detection, also send `trace` as JSON containing 2–240 `{x,y,t}` points, with normalized coordinates and seconds from the video start. Returns HTTP 202: `{"id":"...","status":"queued","progress":0,"status_url":"/v1/jobs/..."}`.
 2. `GET /v1/jobs/{id}` until `status` becomes `complete` or `error`. `progress` is 0–100. Success includes `video_url` and `details`; failure includes `error`.
 3. `GET /v1/jobs/{id}/video` with the Bearer token returns the finished MP4. Download it with an authenticated request and then display the local file in Subpar.
 4. `DELETE /v1/jobs/{id}` after completion for early cleanup.
+
+The source upload is removed when processing finishes. The rendered MP4 stays in `data/results` long enough for the client to download or retry it; the client can delete the job immediately after a successful download. Any remaining finished job and video are removed automatically after the configured retention period (24 hours by default).
 
 ```bash
 curl -H "Authorization: Bearer $TOKEN" -F "video=@shot.mp4" http://127.0.0.1:8765/v1/jobs
@@ -80,3 +82,13 @@ Keep the camera steady and show the ball near impact, with enough contrast betwe
 Run behind HTTPS and a reverse proxy. Proxy upload limits and timeouts must allow your upload size. This single-process queue suits an initial deployment. Horizontal scaling requires a shared queue and result storage; do not run multiple Uvicorn workers against the same data directory.
 
 The bundled model's source and licensing caveat are recorded in [MODEL_SOURCE.md](MODEL_SOURCE.md). Verify its license before commercial deployment.
+
+## Local web test with Subpar
+
+This repository provides the API only; the video upload screen is in Subpar. Use the same random JWT secret in both processes.
+
+1. In this repository, install Python dependencies as shown under **Run**. Set `GOLF_TRACER_JWT_SECRET` to match Subpar and `GOLF_TRACER_ALLOWED_ORIGINS=http://localhost:8081,http://127.0.0.1:8081`, then run Uvicorn on port 8765. Confirm `http://127.0.0.1:8765/healthz` returns `{"status":"ok"}`.
+2. In the Subpar repository, put `GOLF_TRACER_API_URL=http://<computer-LAN-IP>:8765` and the same `GOLF_TRACER_JWT_SECRET` in the ignored `.env.local`. Start Subpar with `yarn start` (port 8081), or keep using an already running instance.
+3. Sign in to Subpar and open `http://localhost:8081/trace-shot`. Choose a golf video, wait for processing, then use the Expo Video player and Post, Download, Share, or Adjust Manually actions. A blank or unsuitable clip opens the manual editor if automatic tracking finds no path.
+
+The API must bind to `0.0.0.0` for phone access. Keep the phone and computer on the same network. For an isolated test account instead of your regular Subpar database, use `PLAYWRIGHT_FAST_SEED=true yarn start-test-server` on port 3000 with `.env.test.local`, then run `STAGE=test node scripts/run-test-migration.mjs seedAlgorithmTestData.js` and sign in as `algorithm.viewer@subpar.test` / `SubparTest123!`. Add both port 3000 origins to `GOLF_TRACER_ALLOWED_ORIGINS` for that mode.

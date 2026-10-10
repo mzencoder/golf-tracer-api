@@ -300,10 +300,10 @@ def build_prediction(track: list[Point], seed: Point | None, total: int,
 
 
 def draw_tracer(frame: np.ndarray, points: list[Point], color: tuple[int, int, int],
-                thickness: int, glow: bool = True) -> None:
+                thickness: int, glow: bool = True, max_gap_frames: int = 6) -> None:
     """Draw a solid tracer with a soft glow only at its growing tip."""
     segments = [(first, second) for first, second in zip(points, points[1:])
-                if second.frame - first.frame <= 6]
+                if second.frame - first.frame <= max_gap_frames]
     if not segments:
         return
     if glow:
@@ -331,6 +331,70 @@ def draw_tracer(frame: np.ndarray, points: list[Point], color: tuple[int, int, i
     for first, second in segments:
         cv2.line(frame, (round(first.x), round(first.y)),
                  (round(second.x), round(second.y)), color, thickness, cv2.LINE_AA)
+
+
+def render_manual_video(source: Path, destination: Path, points: list[dict], progress=None) -> dict:
+    """Render a user-adjusted path on the original video, without rerunning detection."""
+    cap = cv2.VideoCapture(str(source))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if not cap.isOpened() or not (1 <= fps <= 240) or width < 160 or height < 120 or total < 2:
+        cap.release()
+        raise ValueError("Could not read the uploaded video")
+    if points[-1]["t"] > total / fps + 0.1:
+        cap.release()
+        raise ValueError("Manual path extends beyond the video")
+    path = [Point(round(item["t"] * fps), item["x"] * width,
+                  item["y"] * height, 1, "predicted") for item in points]
+    temp = destination.with_suffix(".raw.mp4")
+    writer = cv2.VideoWriter(str(temp), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+    if not writer.isOpened():
+        cap.release()
+        raise RuntimeError("Could not create the rendered video")
+    line_thickness = max(5, round(min(width, height) / 720 * 6))
+    try:
+        frame_id = 0
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            visible = [point for point in path if point.frame <= frame_id]
+            if visible and len(visible) < len(path):
+                next_point = path[len(visible)]
+                previous = visible[-1]
+                if next_point.frame > previous.frame:
+                    fraction = (frame_id - previous.frame) / (next_point.frame - previous.frame)
+                    visible.append(Point(frame_id,
+                                         previous.x + (next_point.x - previous.x) * fraction,
+                                         previous.y + (next_point.y - previous.y) * fraction,
+                                         1, "predicted"))
+            draw_tracer(frame, visible, (48, 59, 255), line_thickness,
+                        max_gap_frames=total)
+            writer.write(frame)
+            frame_id += 1
+            if progress and frame_id % 10 == 0:
+                progress(min(90, int(frame_id / total * 90)))
+    finally:
+        cap.release()
+        writer.release()
+    command = ["ffmpeg", "-y", "-loglevel", "error", "-i", str(temp), "-i", str(source),
+               "-map", "0:v:0", "-map", "1:a?", "-c:v", "libx264", "-preset", "veryfast",
+               "-crf", "22", "-pix_fmt", "yuv420p", "-c:a", "aac", "-movflags", "+faststart",
+               "-shortest", str(destination)]
+    try:
+        subprocess.run(command, check=True, capture_output=True, text=True)
+    finally:
+        temp.unlink(missing_ok=True)
+    if progress:
+        progress(100)
+    return {"trace_found": True, "source": "manual", "detected_frames": 0,
+            "motion_frames": 0, "predicted_frames": len(path), "total_frames": total,
+            "fps": round(fps, 2), "width": width, "height": height,
+            "duration": round(frame_id / fps, 3),
+            "trace_points": [{"x": point["x"], "y": point["y"], "t": point["t"],
+                              "kind": "predicted"} for point in points]}
 
 
 def process_video(source: Path, destination: Path, progress=None) -> dict:

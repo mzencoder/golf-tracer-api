@@ -9,12 +9,12 @@ from threading import Event, Thread
 import time
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 import jwt
 
-from tracker import process_video
+from tracker import process_video, render_manual_video
 
 
 BASE = Path(__file__).parent
@@ -56,6 +56,7 @@ def init_db() -> None:
                 id TEXT PRIMARY KEY,
                 owner TEXT NOT NULL,
                 suffix TEXT NOT NULL,
+                trace_json TEXT,
                 status TEXT NOT NULL,
                 progress INTEGER NOT NULL DEFAULT 0,
                 details TEXT,
@@ -65,6 +66,9 @@ def init_db() -> None:
             )
         """)
         connection.execute("CREATE INDEX IF NOT EXISTS jobs_owner ON jobs(owner, created_at)")
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(jobs)")}
+        if "trace_json" not in columns:
+            connection.execute("ALTER TABLE jobs ADD COLUMN trace_json TEXT")
         connection.execute("UPDATE jobs SET status = 'queued' WHERE status = 'processing'")
 
 
@@ -119,7 +123,10 @@ def run_worker() -> None:
         source = UPLOADS / f"{job_id}{row['suffix']}"
         output = RESULTS / f"{job_id}.mp4"
         try:
-            details = process_video(source, output, lambda value: update_job(job_id, progress=value))
+            details = (render_manual_video(source, output, json.loads(row["trace_json"]),
+                                           lambda value: update_job(job_id, progress=value))
+                       if row["trace_json"] else
+                       process_video(source, output, lambda value: update_job(job_id, progress=value)))
             update_job(job_id, status="complete", progress=100,
                        details=json.dumps(details, separators=(",", ":")))
         except Exception as error:
@@ -189,10 +196,28 @@ def health():
 
 
 @app.post("/v1/jobs", status_code=202)
-async def create_job(video: UploadFile = File(...), owner: str = Depends(current_user)):
+async def create_job(video: UploadFile = File(...), trace: str | None = Form(default=None),
+                     owner: str = Depends(current_user)):
     suffix = Path(video.filename or "").suffix.lower()
     if suffix not in {".mp4", ".mov", ".m4v"}:
         raise HTTPException(400, "Upload MP4, MOV, or M4V video")
+    trace_json = None
+    if trace is not None:
+        try:
+            points = json.loads(trace)
+            if (not isinstance(points, list) or not 2 <= len(points) <= 240 or
+                    any(not isinstance(point, dict) or
+                        any(not isinstance(point.get(key), (int, float)) or
+                            isinstance(point.get(key), bool) for key in ("x", "y", "t")) or
+                        not 0 <= point["x"] <= 1 or not 0 <= point["y"] <= 1 or
+                        not 0 <= point["t"] <= 3600 for point in points) or
+                    any(points[index]["t"] < points[index - 1]["t"]
+                        for index in range(1, len(points))) or
+                    points[-1]["t"] <= points[0]["t"]):
+                raise ValueError()
+            trace_json = json.dumps(points, separators=(",", ":"))
+        except (ValueError, TypeError, KeyError):
+            raise HTTPException(400, "Invalid manual trace points") from None
     job_id = uuid4().hex
     source = UPLOADS / f"{job_id}{suffix}"
     size = 0
@@ -214,9 +239,9 @@ async def create_job(video: UploadFile = File(...), owner: str = Depends(current
             if count >= MAX_ACTIVE_JOBS:
                 raise HTTPException(429, "Analysis queue is full")
             connection.execute(
-                "INSERT INTO jobs(id, owner, suffix, status, progress, created_at, updated_at) "
-                "VALUES (?, ?, ?, 'queued', 0, ?, ?)",
-                (job_id, owner, suffix, now, now),
+                "INSERT INTO jobs(id, owner, suffix, trace_json, status, progress, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, 'queued', 0, ?, ?)",
+                (job_id, owner, suffix, trace_json, now, now),
             )
     except Exception:
         source.unlink(missing_ok=True)
